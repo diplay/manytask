@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,11 +37,14 @@ class Student:
         return f"Student(username={self.username})"
 
 
-class GitLabApiException(Exception):
+class GitLabApiException(gitlab.GitlabError):
     pass
 
 
 class GitLabApi:
+    _FORK_WAIT_ATTEMPTS = 30
+    _FORK_POLL_INTERVAL = 1
+
     def __init__(
         self,
         base_url: str,
@@ -107,17 +111,12 @@ class GitLabApi:
         return new_user  # type: ignore
 
     def _get_group_by_name(self, group_name: str) -> gitlab.v4.objects.Group:
-        short_group_name = group_name.split("/")[-1]
-        group_name_with_spaces = " / ".join(group_name.split("/"))
-
         try:
-            return next(  # type: ignore
-                group
-                for group in self._gitlab.groups.list(get_all=True, search=group_name)
-                if group.name == short_group_name and group.full_name == group_name_with_spaces
-            )
-        except StopIteration:
-            raise RuntimeError(f"Unable to find group {group_name}")
+            return self._gitlab.groups.get(group_name)
+        except gitlab.GitlabGetError as error:
+            if error.response_code != 404:
+                raise
+            raise GitLabApiException(f"Unable to find group {group_name}") from error
 
     def _get_project_by_name(self, project_name: str) -> gitlab.v4.objects.Project:
         short_project_name = project_name.split("/")[-1]
@@ -175,20 +174,138 @@ class GitLabApi:
         self,
         student: Student,
     ) -> bool:
-        gitlab_project_path = f"{self._course_students_group}/{student.username}"
-        logger.info(f"Gitlab project path: {gitlab_project_path}")
+        project = self._find_student_project(student)
+        if project is None or project.attributes.get("default_branch") != self._default_branch:
+            return False
+        if project.attributes.get("import_status") not in ("none", "finished"):
+            return False
+        if any(project.attributes.get(key) != value for key, value in self._student_project_settings().items()):
+            return False
+        try:
+            protection = project.protectedbranches.get(self._default_branch)
+            member = project.members_all.get(student.id)
+        except gitlab.GitlabGetError as error:
+            if error.response_code != 404:
+                raise
+            return False
+        return self._default_branch_is_protected(protection) and (
+            member.access_level == gitlab.const.AccessLevel.DEVELOPER
+            or (student.course_admin and member.access_level >= gitlab.const.AccessLevel.MAINTAINER)
+        )
 
-        for project in self._gitlab.projects.list(get_all=True, search=student.username):
-            logger.info(f"Check project path: {project.path_with_namespace}")
+    def _find_student_project(self, student: Student) -> gitlab.v4.objects.Project | None:
+        path = f"{self._course_students_group}/{student.username}"
+        try:
+            return self._gitlab.projects.get(path)
+        except gitlab.GitlabGetError as error:
+            if error.response_code != 404:
+                raise
+            return None
 
-            # Because of implicit conversion
-            # TODO: make global problem solve
-            if project.path_with_namespace == gitlab_project_path:
-                logger.info(f"Project {student.username} for group {self._course_students_group} exists")
-                return True
+    def _student_project_settings(self) -> dict[str, Any]:
+        return {
+            "visibility": "private",
+            "ci_config_path": f".gitlab-ci.yml@{self._course_public_repo}",
+            "ci_pipeline_variables_minimum_override_role": "no_one_allowed",
+            "ci_allow_fork_pipelines_to_run_in_parent_project": False,
+            "forking_access_level": "disabled",
+            "shared_runners_enabled": False,
+            "auto_devops_enabled": False,
+            "mr_default_target_self": True,
+        }
 
-        logger.info(f"Project {student.username} for group {self._course_students_group} does not exist")
-        return False
+    def _wait_for_student_project(self, project_id: int) -> gitlab.v4.objects.Project:
+        for attempt in range(self._FORK_WAIT_ATTEMPTS):
+            project = self._gitlab.projects.get(project_id)
+            if project.attributes.get("import_status") == "failed":
+                raise GitLabApiException("Student repository import failed; retry after fixing the import")
+            default_branch = project.attributes.get("default_branch")
+            if project.attributes.get("import_status") in ("none", "finished") and default_branch:
+                if default_branch != self._default_branch:
+                    raise GitLabApiException(f"Student repository must use default branch {self._default_branch}")
+                try:
+                    project.branches.get(self._default_branch)
+                    return project
+                except gitlab.GitlabGetError as error:
+                    if error.response_code != 404:
+                        raise
+            if attempt + 1 < self._FORK_WAIT_ATTEMPTS:
+                time.sleep(self._FORK_POLL_INTERVAL)
+        raise GitLabApiException("Student repository import is not ready yet; please retry")
+
+    @staticmethod
+    def _default_branch_is_protected(protection: gitlab.v4.objects.ProjectProtectedBranch) -> bool:
+        attributes = protection.attributes
+        for access_field, expected in (("push_access_levels", 30), ("merge_access_levels", 40)):
+            levels = attributes.get(access_field, [])
+            if len(levels) != 1 or levels[0].get("access_level") != expected:
+                return False
+            if any(
+                levels[0].get(key) is not None for key in ("user_id", "group_id", "deploy_key_id", "member_role_id")
+            ):
+                return False
+        return attributes.get("allow_force_push") is False
+
+    def _protect_student_default_branch(self, project: gitlab.v4.objects.Project) -> None:
+        try:
+            protection = project.protectedbranches.get(self._default_branch)
+        except gitlab.GitlabGetError as error:
+            if error.response_code != 404:
+                raise
+        else:
+            if self._default_branch_is_protected(protection):
+                return
+            # Role-level updates need a paid tier. Replace only this rule on GitLab Free.
+            if protection.attributes.get("inherited"):
+                raise GitLabApiException("Inherited default branch protection does not match the course policy")
+            protection.delete()
+        project.protectedbranches.create(
+            {
+                "name": self._default_branch,
+                "push_access_level": gitlab.const.AccessLevel.DEVELOPER,
+                "merge_access_level": gitlab.const.AccessLevel.MAINTAINER,
+                "allow_force_push": False,
+            }
+        )
+        if not self._default_branch_is_protected(project.protectedbranches.get(self._default_branch)):
+            raise GitLabApiException("Unable to verify student default branch protection")
+
+    def _grant_project_access(
+        self,
+        project: gitlab.v4.objects.Project,
+        student: Student,
+        access_level: int,
+        *,
+        allow_higher: bool = False,
+    ) -> None:
+        try:
+            member = project.members_all.get(student.id)
+        except gitlab.GitlabGetError as error:
+            if error.response_code != 404:
+                raise
+        else:
+            if member.access_level >= access_level and allow_higher:
+                return
+            if member.access_level > access_level:
+                if student.course_admin:
+                    return
+                raise GitLabApiException("Student already has elevated project access; review group memberships")
+        try:
+            direct_member = project.members.get(student.id)
+        except gitlab.GitlabGetError as error:
+            if error.response_code != 404:
+                raise
+            try:
+                project.members.create({"user_id": student.id, "access_level": access_level})
+            except gitlab.GitlabCreateError as error:
+                if error.response_code != 409:
+                    raise
+        else:
+            if direct_member.access_level != access_level:
+                project.members.update(student.id, {"access_level": access_level})
+        actual_access = project.members_all.get(student.id).access_level
+        if actual_access < access_level or (actual_access != access_level and not allow_higher):
+            raise GitLabApiException("Unable to verify student project access")
 
     def create_project(
         self,
@@ -196,74 +313,48 @@ class GitLabApi:
     ) -> None:
         course_group = self._get_group_by_name(self._course_students_group)
 
-        gitlab_project_path = f"{self._course_students_group}/{student.username}"
-        logger.info(f"Gitlab project path: {gitlab_project_path}")
-
-        for project in self._gitlab.projects.list(get_all=True, search=student.username):
-            logger.info(f"Check project path: {project.path_with_namespace}")
-
-            # Because of implicit conversion
-            # TODO: make global problem solve
-            if project.path_with_namespace == gitlab_project_path:
-                logger.info(f"Project {student.username} for group {self._course_students_group} already exists")
-                project = self._gitlab.projects.get(project.id)
-
-                # ensure student is a member of the project
-                try:
-                    member = project.members.create(
-                        {
-                            "user_id": student.id,
-                            "access_level": gitlab.const.AccessLevel.DEVELOPER,
-                        }
-                    )
-                    logger.info(f"Project exists, Access to fork granted for {member.username}")
-                except gitlab.GitlabCreateError:
-                    logger.info(f"Project exists, Access already granted for {student.username} or WTF")
-
-                return
-
-        logger.info(f"Student username {student.username}")
-        logger.info(f"Course group {course_group.name}")
-
         course_public_project = self._get_project_by_name(self._course_public_repo)
-        fork = course_public_project.forks.create(
-            {
-                "name": student.username,
-                "path": student.username,
-                "namespace_id": course_group.id,
-                "forking_access_level": "disabled",
-                # MR target self main
-                "mr_default_target_self": True,
-                # Enable shared runners
-                # TODO: Relay on groups runners
-                # "shared_runners_enabled": course_group.shared_runners_setting == "enabled",
-                # Set external gitlab-ci config from public repo
-                "ci_config_path": f".gitlab-ci.yml@{course_public_project.path_with_namespace}",
-                # Merge method to squash
-                "merge_method": "squash",
-                # Disable AutoDevOps
-                "auto_devops_enabled": False,
-            }
-        )
-        project = self._gitlab.projects.get(fork.id)
-        # TODO: think .evn config value
-        # Unprotect all branches
-        for protected_branch in project.protectedbranches.list(get_all=True):
-            protected_branch.delete()
-        project.save()
-
-        logger.info(f"Git project forked {course_public_project.path_with_namespace} -> {project.path_with_namespace}")
-
-        try:
-            member = project.members.create(
-                {
-                    "user_id": student.id,
-                    "access_level": gitlab.const.AccessLevel.DEVELOPER,
-                }
+        project = self._find_student_project(student)
+        if project is None:
+            try:
+                fork = course_public_project.forks.create(
+                    {
+                        "name": student.username,
+                        "path": student.username,
+                        "namespace_id": course_group.id,
+                        "visibility": "private",
+                        "mr_default_target_self": True,
+                    }
+                )
+            except gitlab.GitlabCreateError as error:
+                if error.response_code != 409:
+                    raise
+                project = self._find_student_project(student)
+                if project is None:
+                    raise
+            else:
+                project = self._gitlab.projects.get(fork.id)
+        project = self._wait_for_student_project(project.id)
+        if (
+            project.path_with_namespace != f"{self._course_students_group}/{student.username}"
+            or (project.attributes.get("namespace") or {}).get("id") != course_group.id
+            or (project.attributes.get("forked_from_project") or {}).get("id") != course_public_project.id
+        ):
+            raise GitLabApiException("Existing repository does not match this student's course fork")
+        settings = self._student_project_settings()
+        updates = {key: value for key, value in settings.items() if project.attributes.get(key) != value}
+        if updates:
+            self._gitlab.projects.update(project.id, updates)
+        project = self._gitlab.projects.get(project.id)
+        if any(project.attributes.get(key) != value for key, value in settings.items()):
+            raise GitLabApiException("Unable to verify student repository settings")
+        self._protect_student_default_branch(project)
+        if course_public_project.attributes.get("visibility") == "private":
+            self._grant_project_access(
+                course_public_project, student, gitlab.const.AccessLevel.REPORTER, allow_higher=True
             )
-            logger.info(f"Access to fork granted for {member.username}")
-        except gitlab.GitlabCreateError:
-            logger.info(f"Access already granted for {student.username} or smth happened")
+        self._grant_project_access(project, student, gitlab.const.AccessLevel.DEVELOPER)
+        logger.info("Student repository ready: %s", project.path_with_namespace)
 
     def _check_is_course_admin(self, user_id: int) -> bool:
         try:

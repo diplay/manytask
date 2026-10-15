@@ -278,7 +278,7 @@ def create_project() -> ResponseReturnValue:
         course.gitlab_api.create_project(student)
     except gitlab.GitlabError as ex:
         logger.error(f"Project creation failed: {ex.error_message}")
-        return render_template("signup.html", error_message=ex.error_message, course_name=course.name)
+        return render_template("create_project.html", error_message=ex.error_message, course_name=course.name)
 
     return redirect(url_for("web.course_page"))
 

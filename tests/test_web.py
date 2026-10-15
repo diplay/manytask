@@ -1,5 +1,6 @@
 import os
 from datetime import datetime
+from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -8,7 +9,7 @@ from pydantic import AnyUrl
 
 from manytask.abstract import StoredUser
 from manytask.config import ManytaskConfig, ManytaskDeadlinesConfig, ManytaskSettingsConfig, ManytaskUiConfig
-from manytask.glab import Student
+from manytask.glab import GitLabApiException, Student
 from manytask.web import bp as web_bp
 from manytask.web import get_allscores_url
 
@@ -449,3 +450,56 @@ def test_login_finish_sync(app, mock_course, mock_gitlab_oauth):
                 assert not sess["gitlab"]["course_admin"]
 
             assert app.course.storage_api.stored_user.course_admin
+
+
+def test_login_with_unfinished_project_returns_to_join_form(app, mock_course, mock_gitlab_oauth):
+    app.course = mock_course
+    app.oauth = mock_gitlab_oauth
+    mock_course.gitlab_api.check_project_exists = MagicMock(return_value=False)
+    response = app.test_client().get("/login_finish")
+    assert response.status_code == 302
+    assert response.headers["Location"] == "/create_project"
+
+
+@pytest.mark.parametrize("secret", [TEST_SECRET, "wrong-secret"])
+def test_create_project_requires_invitation_and_provisions_authenticated_user(app, mock_course, secret):
+    app.course = mock_course
+    mock_course.gitlab_api.create_project = MagicMock()
+    with app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["gitlab"] = {
+                "version": TEST_VERSION,
+                "user_id": TEST_USER_ID,
+                "username": TEST_USERNAME,
+                "repo": TEST_REPO,
+                "course_admin": False,
+                "oauth_access_token": TEST_TOKEN,
+            }
+        response = client.post("/create_project", data={"secret": secret, "username": "someone-else"})
+    if secret == TEST_SECRET:
+        assert response.status_code == 302
+        mock_course.gitlab_api.create_project.assert_called_once_with(
+            Student(id=TEST_USER_ID, username=TEST_USERNAME, name="", course_admin=False)
+        )
+    else:
+        assert response.status_code == 200
+        mock_course.gitlab_api.create_project.assert_not_called()
+
+
+def test_creation_error_keeps_join_form_for_retry(app, mock_course):
+    app.course = mock_course
+    mock_course.gitlab_api.create_project = MagicMock(side_effect=GitLabApiException("Import not ready; retry"))
+    with app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["gitlab"] = {
+                "version": TEST_VERSION,
+                "user_id": TEST_USER_ID,
+                "username": TEST_USERNAME,
+                "repo": TEST_REPO,
+                "course_admin": False,
+                "oauth_access_token": TEST_TOKEN,
+            }
+        response = client.post("/create_project", data={"secret": TEST_SECRET})
+    assert response.status_code == 200
+    assert b"Import not ready; retry" in response.data
+    assert b"Join course" in response.data

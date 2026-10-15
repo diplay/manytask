@@ -55,7 +55,7 @@ def create_app(*, debug: bool | None = None, test: bool = False) -> CustomFlask:
         userinfo_endpoint=f"{_gitlab_base_url}/oauth/userinfo",
         jwks_uri=f"{_gitlab_base_url}/oauth/discovery/keys",
         client_kwargs={
-            "scope": "openid email profile read_user",
+            "scope": "read_user",
             "code_challenge_method": "S256",
         },
     )
