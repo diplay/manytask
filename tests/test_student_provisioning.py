@@ -193,7 +193,7 @@ def test_inherited_protection_is_not_deleted(provisioning):
     p = provisioning
     p.api.create_project(p.student)
     protection = p.state["protection"]
-    protection.attributes.update(inherited=True, allow_force_push=True)
+    protection.attributes.update(inherited=True, allow_force_push=False)
     with pytest.raises(GitLabApiException, match="Inherited"):
         p.api.create_project(p.student)
     protection.delete.assert_not_called()
@@ -292,3 +292,30 @@ def test_private_starter_failure_blocks_student_access(provisioning):
     with pytest.raises(gitlab.GitlabCreateError):
         p.api.create_project(p.student)
     p.project.members.create.assert_not_called()
+
+
+
+def test_new_master_allows_force_push_without_elevating_student(provisioning):
+    p = provisioning
+    p.api._default_branch = "master"
+    p.project.attributes["default_branch"] = "master"
+    p.api.create_project(p.student)
+    assert p.state["protection"].attributes["allow_force_push"] is True
+    assert p.state["protection"].attributes["push_access_levels"] == [{"access_level": 30}]
+    assert p.state["protection"].attributes["merge_access_levels"] == [{"access_level": 40}]
+    assert p.state["direct"] == 30
+    assert p.api.check_project_exists(p.student)
+
+
+def test_existing_master_without_force_push_is_repaired_and_recognized(provisioning):
+    p = provisioning
+    p.api._default_branch = "master"
+    p.project.attributes["default_branch"] = "master"
+    p.api.create_project(p.student)
+    protection = p.state["protection"]
+    protection.attributes["allow_force_push"] = False
+    assert not p.api.check_project_exists(p.student)
+    p.api.create_project(p.student)
+    assert p.state["protection"].attributes["allow_force_push"] is True
+    assert p.api.check_project_exists(p.student)
+    assert p.source.forks.create.call_count == 1

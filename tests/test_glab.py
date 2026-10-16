@@ -165,7 +165,7 @@ def mock_gitlab_student_project(mock_gitlab_group_member: GroupMember) -> Projec
     project.protectedbranches.get.return_value.attributes = {
         "push_access_levels": [{"access_level": 30}],
         "merge_access_levels": [{"access_level": 40}],
-        "allow_force_push": False,
+        "allow_force_push": True,
     }
     project.members.get.return_value.access_level = const.AccessLevel.DEVELOPER
     project.members_all.get.return_value.access_level = const.AccessLevel.DEVELOPER

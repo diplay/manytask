@@ -196,7 +196,10 @@ class GitLabApi:
     def _find_student_project(self, student: Student) -> gitlab.v4.objects.Project | None:
         path = f"{self._course_students_group}/{student.username}"
         try:
-            return self._gitlab.projects.get(path)
+            project = self._gitlab.projects.get(path)
+            if project.path_with_namespace != path:
+                return None
+            return project
         except gitlab.GitlabGetError as error:
             if error.response_code != 404:
                 raise
@@ -244,7 +247,7 @@ class GitLabApi:
                 levels[0].get(key) is not None for key in ("user_id", "group_id", "deploy_key_id", "member_role_id")
             ):
                 return False
-        return attributes.get("allow_force_push") is False
+        return attributes.get("allow_force_push") is True
 
     def _protect_student_default_branch(self, project: gitlab.v4.objects.Project) -> None:
         try:
@@ -264,7 +267,7 @@ class GitLabApi:
                 "name": self._default_branch,
                 "push_access_level": gitlab.const.AccessLevel.DEVELOPER,
                 "merge_access_level": gitlab.const.AccessLevel.MAINTAINER,
-                "allow_force_push": False,
+                "allow_force_push": True,
             }
         )
         if not self._default_branch_is_protected(project.protectedbranches.get(self._default_branch)):
