@@ -13,6 +13,8 @@ from cachelib import BaseCache
 from google.auth.credentials import AnonymousCredentials
 from gspread import Cell as GCell
 from gspread.utils import ValueInputOption, ValueRenderOption, a1_to_rowcol, rowcol_to_a1
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .abstract import StorageApi, StoredUser, ViewerApi
 from .config import ManytaskConfig, ManytaskDeadlinesConfig
@@ -112,6 +114,24 @@ class GoogleDocApi(ViewerApi, StorageApi):
         self._public_scoreboard_sheet = public_scoreboard_sheet
 
         self._assertion_session = self._create_assertion_session()
+        self._assertion_session.mount(
+            "https://sheets.googleapis.com/",
+            HTTPAdapter(
+                max_retries=Retry(
+                    total=6,
+                    connect=0,
+                    read=0,
+                    other=0,
+                    allowed_methods=frozenset({"GET"}),
+                    status_forcelist=(429,),
+                    backoff_factor=1,
+                    backoff_max=32,
+                    backoff_jitter=1,
+                    respect_retry_after_header=False,
+                    raise_on_status=False,
+                ),
+            ),
+        )
 
         self._public_scores_sheet = self._get_sheet(public_worksheet_id, public_scoreboard_sheet)
         self._cache = cache
