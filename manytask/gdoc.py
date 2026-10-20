@@ -355,7 +355,7 @@ class GoogleDocApi(ViewerApi, StorageApi):
         if max_score:
             cells_to_update.append(
                 GCell(
-                    PublicAccountsSheetOptions.GROUPS_ROW,
+                    PublicAccountsSheetOptions.MAX_SCORES_ROW,
                     PublicAccountsSheetOptions.TOTAL_COLUMN,
                     str(max_score),
                 )
