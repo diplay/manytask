@@ -4,6 +4,8 @@ from typing import Any, Callable
 
 from flask import current_app, redirect, render_template, request, session, url_for
 from flask.sessions import SessionMixin
+from flask.typing import ResponseReturnValue
+from requests import HTTPError
 
 
 def valid_session(user_session: SessionMixin) -> bool:
@@ -17,6 +19,19 @@ def valid_session(user_session: SessionMixin) -> bool:
         and "repo" in user_session["gitlab"]
         and "course_admin" in user_session["gitlab"]
     )
+
+
+def reauthenticate_on_expired_token(error: Exception) -> ResponseReturnValue | None:
+    course = current_app.course  # type: ignore
+    if (
+        isinstance(error, HTTPError)
+        and error.response is not None
+        and error.response.status_code == 401
+        and error.response.url == f"{course.gitlab_api.base_url}/api/v4/user"
+    ):
+        session.pop("gitlab", None)
+        return redirect(url_for("web.login"))
+    return None
 
 
 def requires_auth(f: Callable[..., Any]) -> Callable[..., Any]:
@@ -73,6 +88,9 @@ def requires_secret(template: str = "create_project.html") -> Callable[..., Any]
                     )
 
             except Exception as e:
+                login_redirect = reauthenticate_on_expired_token(e)
+                if login_redirect is not None:
+                    return login_redirect
                 return render_template(
                     template,
                     error_message=str(e),

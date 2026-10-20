@@ -5,7 +5,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from flask import Flask, url_for
+from gitlab import GitlabAuthenticationError
 from pydantic import AnyUrl
+from requests import HTTPError, Response
 
 from manytask.abstract import StoredUser
 from manytask.config import ManytaskConfig, ManytaskDeadlinesConfig, ManytaskSettingsConfig, ManytaskUiConfig
@@ -503,3 +505,141 @@ def test_creation_error_keeps_join_form_for_retry(app, mock_course):
     assert response.status_code == 200
     assert b"Import not ready; retry" in response.data
     assert b"Join course" in response.data
+
+
+def oauth_profile_error(status=401, url=f"{GITLAB_BASE_URL}/api/v4/user"):
+    response = Response()
+    response.status_code = status
+    response.url = url
+    return HTTPError(f"{status} GitLab profile error", response=response)
+
+
+def expired_gitlab_session():
+    return {
+        "version": TEST_VERSION,
+        "username": TEST_USERNAME,
+        "user_id": TEST_USER_ID,
+        "repo": TEST_REPO,
+        "course_admin": False,
+        "oauth_access_token": "expired-test-access-token",
+        "oauth_refresh_token": "expired-test-refresh-token",
+    }
+
+
+@pytest.mark.parametrize("method,path", [("GET", "/"), ("POST", "/"), ("POST", "/create_project")])
+def test_expired_oauth_session_redirects_to_login_without_joining(app, mock_course, method, path):
+    app.course = mock_course
+    mock_course.gitlab_api.get_authenticated_student = MagicMock(side_effect=oauth_profile_error())
+    mock_course.gitlab_api.check_project_exists = MagicMock()
+    mock_course.gitlab_api.create_project = MagicMock()
+    mock_course.storage_api.get_scores = MagicMock()
+    with app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["gitlab"] = expired_gitlab_session()
+            sess["unrelated"] = "preserve-me"
+        response = client.open(path, method=method, data={"secret": TEST_SECRET} if method == "POST" else None)
+        assert response.status_code == 302
+        assert response.headers["Location"] == "/login"
+        assert TEST_SECRET.encode() not in response.data
+        assert b"Join course" not in response.data
+        with client.session_transaction() as sess:
+            assert "gitlab" not in sess
+            assert sess["unrelated"] == "preserve-me"
+    mock_course.gitlab_api.check_project_exists.assert_not_called()
+    mock_course.gitlab_api.create_project.assert_not_called()
+    mock_course.storage_api.get_scores.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [403, 429, 500, 503])
+def test_other_profile_failures_keep_the_session(app, mock_course, status):
+    app.course = mock_course
+    mock_course.gitlab_api.get_authenticated_student = MagicMock(side_effect=oauth_profile_error(status))
+    with app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["gitlab"] = expired_gitlab_session()
+        response = client.get("/")
+        assert response.status_code == 200
+        assert b"GitLab profile error" in response.data
+        with client.session_transaction() as sess:
+            assert sess["gitlab"] == expired_gitlab_session()
+
+
+@pytest.mark.parametrize("path", ["projects", "users/123"])
+def test_unauthorized_backend_request_does_not_restart_user_login(app, mock_course, path):
+    app.course = mock_course
+    mock_course.gitlab_api.check_project_exists = MagicMock(
+        side_effect=oauth_profile_error(url=f"{GITLAB_BASE_URL}/api/v4/{path}")
+    )
+    with app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["gitlab"] = expired_gitlab_session()
+        response = client.get("/")
+        assert response.status_code == 200
+        with client.session_transaction() as sess:
+            assert "gitlab" in sess
+
+
+def test_gitlab_service_authentication_error_does_not_clear_user_session(app, mock_course):
+    app.course = mock_course
+    mock_course.gitlab_api.check_project_exists = MagicMock(
+        side_effect=GitlabAuthenticationError("Service credential rejected", response_code=401)
+    )
+    with app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["gitlab"] = expired_gitlab_session()
+        response = client.get("/")
+        assert response.status_code == 200
+        assert b"Service credential rejected" in response.data
+        with client.session_transaction() as sess:
+            assert "gitlab" in sess
+
+
+def test_http_error_without_response_does_not_clear_session(app, mock_course):
+    app.course = mock_course
+    mock_course.gitlab_api.get_authenticated_student = MagicMock(side_effect=HTTPError("No response"))
+    with app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["gitlab"] = expired_gitlab_session()
+        response = client.get("/")
+        assert response.status_code == 200
+        with client.session_transaction() as sess:
+            assert "gitlab" in sess
+
+
+def test_oauth_retry_returns_existing_student_to_course(app, mock_course):
+    app.course = mock_course
+    student = Student(id=TEST_USER_ID, username=TEST_USERNAME, name="", repo=TEST_REPO)
+
+    def get_student(token):
+        if token == "expired-test-access-token":
+            raise oauth_profile_error()
+        assert token == "renewed-test-access-token"
+        return student
+
+    mock_course.gitlab_api.get_authenticated_student = MagicMock(side_effect=get_student)
+    mock_course.gitlab_api.check_project_exists = MagicMock(return_value=True)
+    mock_course.gitlab_api.create_project = MagicMock()
+    mock_course.storage_api.sync_stored_user = MagicMock()
+    app.oauth = MagicMock()
+    app.oauth.gitlab.authorize_redirect.return_value = app.redirect(f"{GITLAB_BASE_URL}/oauth/authorize")
+    app.oauth.gitlab.authorize_access_token.return_value = {
+        "access_token": "renewed-test-access-token",
+        "refresh_token": "renewed-test-refresh-token",
+    }
+    with app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["gitlab"] = expired_gitlab_session()
+        expired = client.get("/")
+        assert expired.status_code == 302 and expired.headers["Location"] == "/login"
+        login = client.get("/login")
+        assert login.status_code == 302 and login.headers["Location"] == f"{GITLAB_BASE_URL}/oauth/authorize"
+        callback = client.get("/login_finish")
+        assert callback.status_code == 302 and callback.headers["Location"] == "/"
+        page = client.get("/")
+        assert page.status_code == 200
+        assert b"Join course" not in page.data
+        with client.session_transaction() as sess:
+            assert sess["gitlab"]["oauth_access_token"] == "renewed-test-access-token"
+            assert sess["gitlab"]["oauth_refresh_token"] == "renewed-test-refresh-token"
+            assert sess["gitlab"]["username"] == TEST_USERNAME
+    mock_course.gitlab_api.create_project.assert_not_called()

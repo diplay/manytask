@@ -7,9 +7,10 @@ from authlib.integrations.base_client import OAuthError
 from authlib.integrations.flask_client import OAuth
 from flask import Blueprint, Response, current_app, redirect, render_template, request, session, url_for
 from flask.typing import ResponseReturnValue
+from requests import HTTPError
 
 from . import abstract, glab
-from .auth import requires_auth, requires_ready, requires_secret
+from .auth import reauthenticate_on_expired_token, requires_auth, requires_ready, requires_secret
 from .course import Course, get_current_time
 from .database_utils import get_database_table_data
 
@@ -271,7 +272,13 @@ def create_project() -> ResponseReturnValue:
         )
 
     gitlab_access_token: str = session["gitlab"]["oauth_access_token"]
-    student = course.gitlab_api.get_authenticated_student(gitlab_access_token)
+    try:
+        student = course.gitlab_api.get_authenticated_student(gitlab_access_token)
+    except HTTPError as error:
+        login_redirect = reauthenticate_on_expired_token(error)
+        if login_redirect is not None:
+            return login_redirect
+        raise
 
     # Create use if needed
     try:
